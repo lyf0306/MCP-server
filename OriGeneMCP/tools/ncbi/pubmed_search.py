@@ -1,36 +1,36 @@
 import requests
 import logging
-import time
+import re
+import xml.etree.ElementTree as ET
 
 logger = logging.getLogger(__name__)
 
 class PubMedSearch:
-    """
-    Directly search PubMed using NCBI E-Utilities API.
-    Strictly finds literature from 2024 to present.
-    """
     BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
     def search(self, query: str, max_results: int = 5) -> str:
-        """
-        Args:
-            query: Medical keywords (e.g. "Pembrolizumab endometrial cancer")
-        """
         try:
-            # 1. ESearch: Search for IDs
-            # 限定日期：2024/01/01 至今
-            term = f"{query} AND (2024/01/01:3000/12/31[pdat])" 
+            term = query.replace("'", '"')
             search_params = {
                 "db": "pubmed",
                 "term": term,
                 "retmode": "json",
                 "retmax": max_results,
-                "sort": "date"  # 按日期降序，获取最新的
+                "sort": "date"
             }
+            # 增加超时时间到 15 秒
+            resp = requests.post(f"{self.BASE_URL}/esearch.fcgi", data=search_params, timeout=15)
             
-            # 建议在内网环境若无 API Key，请求频率需控制（每秒不超过3次）
-            resp = requests.get(f"{self.BASE_URL}/esearch.fcgi", params=search_params, timeout=10)
-            
+            if resp.status_code == 400:
+                logger.warning(f"PubMed rejected complex query. Trying simplified fallback...")
+                clean_term = re.sub(r'\[.*?\]', '', term)
+                clean_term = clean_term.replace('"', '').replace("'", "")
+                clean_term = re.sub(r'\b(AND|OR|NOT)\b', ' ', clean_term, flags=re.IGNORECASE)
+                clean_term = re.sub(r'[\(\):]', ' ', clean_term)
+                clean_term = re.sub(r'\s+', ' ', clean_term).strip()
+                search_params["term"] = clean_term
+                resp = requests.post(f"{self.BASE_URL}/esearch.fcgi", data=search_params, timeout=15)
+                
             if resp.status_code != 200:
                 return f"Error: PubMed API returned status {resp.status_code}"
 
@@ -38,31 +38,36 @@ class PubMedSearch:
             id_list = data.get("esearchresult", {}).get("idlist", [])
             
             if not id_list:
-                return "No PubMed articles found from 2024-present for this query."
+                return f"No PubMed articles found for query: {query}"
 
-            # 2. ESummary: Get details
             ids = ",".join(id_list)
-            summary_params = {
+            fetch_params = {
                 "db": "pubmed",
                 "id": ids,
-                "retmode": "json"
+                "retmode": "xml"
             }
-            summary_resp = requests.get(f"{self.BASE_URL}/esummary.fcgi", params=summary_params, timeout=10)
-            summary_result = summary_resp.json().get("result", {})
+            # 🚀 致命修复：抓取全文摘要时增加超时到 30 秒！防止半路断开！
+            fetch_resp = requests.post(f"{self.BASE_URL}/efetch.fcgi", data=fetch_params, timeout=30)
             
-            # 3. Format Output
+            try:
+                root = ET.fromstring(fetch_resp.content)
+            except ET.ParseError:
+                return "Error parsing PubMed XML response."
+
             results = []
-            for uid in id_list:
-                # 'uids' 列表在 summary_result['uids'] 中，但直接用 uid key 访问详细项
-                if uid not in summary_result: continue
-                item = summary_result[uid]
+            for article in root.findall('.//PubmedArticle'):
+                pmid = article.findtext('.//PMID', default="Unknown PMID")
+                title = article.findtext('.//ArticleTitle', default="No Title")
                 
-                title = item.get("title", "No Title")
-                pub_date = item.get("pubdate", "Unknown Date")
-                source = item.get("source", "Unknown Journal")
-                url = f"https://pubmed.ncbi.nlm.nih.gov/{uid}/"
-                
-                results.append(f"Title: {title}\nDate: {pub_date}\nJournal: {source}\nURL: {url}\n")
+                # 🚀 致命修复：使用 itertext() 提取摘要！这样无论里面有多少 <i> <b> 标签，都能把所有文字完美提取出来！
+                abstract_texts = article.findall('.//AbstractText')
+                if abstract_texts:
+                    abstract = " ".join(["".join(a.itertext()).strip() for a in abstract_texts])
+                else:
+                    abstract = "No abstract available."
+                    
+                url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                results.append(f"PMID: {pmid}\nTitle: {title}\nAbstract: {abstract}\nURL: {url}")
             
             return "\n---\n".join(results)
 
